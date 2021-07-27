@@ -1,0 +1,81 @@
+---
+title: "Classification"
+output: html_notebook
+---
+
+```{r}
+library("data.table")
+library("caret")
+library("ggplot2")
+```
+
+Load data
+```{r}
+BreastCancer <- fread("data/breast-cancer-wisconsin.data")
+colnames(BreastCancer) <- c("ID", "ClumpThick", "UniSize", "UniShape", "MargAdh", "SingEpiCellSize", "BareNuclei", "BlandChr", "NormalNucl", "Mitoses", "Class")
+```
+
+```{r}
+# Quick check of data
+summary(BreastCancer)
+table(BreastCancer$Class) # unequal distribution of classes
+BreastCancer$Class <- as.factor(BreastCancer$Class)
+BreastCancer$BareNuclei <- as.integer(BreastCancer$BareNuclei)
+```
+```{r}
+# Checking if there is NA values
+sum(is.na(BreastCancer)) # 
+
+# Setting the random seed number for reproducibility
+set.seed(123)
+
+# Stratisfied random split of data into training and test data set
+Index <- createDataPartition(BreastCancer$Class, p = 0.8, list = FALSE)
+TrainingSet <- BreastCancer[Index,]
+TestSet <- BreastCancer[-Index,]
+```
+
+```{r}
+ggplot(TrainingSet, aes(x = ClumpThick, y = UniSize)) + geom_jitter(color = "red") + geom_jitter(data = TestSet, aes(x = ClumpThick, y = UniSize), color = "blue") + theme_light()
+```
+
+Support Vector Machine (SVM model)
+```{r}
+# Building training model
+Model <- train(Class ~ .-ID, data = TrainingSet,
+                    method = "svmPoly",
+                    na.action = na.omit,
+                    preProcess = c("scale", "center"),
+                    trControl = trainControl(method = "none"),
+                    tuneGrid = data.frame(degree = 1, scale = 1, C = 1)
+                    )
+
+# Building CV model
+CVModel <- train(Class ~ .-ID, data = TrainingSet,
+                    method = "svmPoly",
+                    na.action = na.omit,
+                    preProcess = c("scale", "center"),
+                    trControl = trainControl(method = "cv", number = 10),
+                    tuneGrid = data.frame(degree = 1, scale = 1, C = 1)
+                    )
+
+# Predict with the built model
+PredictedTrainSet <- predict(Model, TrainingSet)
+PredictedTestSet <- predict(Model, TestSet)
+CV <- predict(CVModel, TrainingSet)
+
+# How well the model predicts?
+PerfTrainPred <- confusionMatrix(PredictedTrainSet, TrainingSet[BareNuclei != "NA", Class])
+PerfTrainPred #Accuracy: 0.9726
+
+PerfTestPred <- confusionMatrix(PredictedTestSet, TestSet[BareNuclei != "NA", Class])
+PerfTestPred # Accuracy: 0.9778
+
+PerfCVPred <- confusionMatrix(CV, TrainingSet[BareNuclei != "NA", Class])
+PerfCVPred # Accuracy: 0.9726
+
+# Feature importance
+FeatImport <- varImp(Model)
+plot(FeatImport)
+```
+
