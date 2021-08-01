@@ -7,6 +7,7 @@ output: html_notebook
 library("data.table")
 library("caret")
 library("ggplot2")
+library("corrplot")
 ```
 
 Load data
@@ -19,24 +20,31 @@ colnames(BreastCancer) <- c("ID", "ClumpThick", "UniSize", "UniShape", "MargAdh"
 # Quick check of data
 summary(BreastCancer)
 table(BreastCancer$Class) # unequal distribution of classes
-BreastCancer$Class <- as.factor(BreastCancer$Class)
+
 BreastCancer$BareNuclei <- as.integer(BreastCancer$BareNuclei)
+CorPlot <- cor(BreastCancer[,2:10], method = "pearson", use = "complete.obs")
+highlyCorrelated <- findCorrelation(CorPlot, cutoff = 0.75)
+highlyCorrelated # need to remove UniSize
+corrplot.mixed(CorPlot, order = "hclust")
+
+BreastCancer$Class <- as.factor(BreastCancer$Class)
 ```
 ```{r}
 # Checking if there is NA values
-sum(is.na(BreastCancer)) # 
+sapply(BreastCancer, function(x) sum(is.na(x))) # 16 in BareNuclei column, those rows will be omitted
+
 
 # Setting the random seed number for reproducibility
 set.seed(123)
 
 # Stratisfied random split of data into training and test data set
 Index <- createDataPartition(BreastCancer$Class, p = 0.8, list = FALSE)
-TrainingSet <- BreastCancer[Index,]
-TestSet <- BreastCancer[-Index,]
+TrainingSet <- BreastCancer[Index, c(1:2,4:11)] # Removed UniSize
+TestSet <- BreastCancer[-Index, c(1:2,4:11)]
 ```
 
 ```{r}
-ggplot(TrainingSet, aes(x = ClumpThick, y = UniSize)) + geom_jitter(color = "red") + geom_jitter(data = TestSet, aes(x = ClumpThick, y = UniSize), color = "blue") + theme_light()
+ggplot(TrainingSet, aes(x = ClumpThick, y = UniShape)) + geom_jitter(color = "red") + geom_jitter(data = TestSet, aes(x = ClumpThick, y = UniShape), color = "blue") + theme_light()
 ```
 
 Support Vector Machine (SVM model)
@@ -79,3 +87,28 @@ FeatImport <- varImp(Model)
 plot(FeatImport)
 ```
 
+Logistic regression as a classification method
+```{r}
+# data
+GLM_data <- copy(BreastCancer)
+GLM_data[, Class := ifelse(Class == "2", 0, 1)]
+
+TrainingSetGLM <- GLM_data[Index, ][!(is.na(BareNuclei))]
+TestSetGLM <- GLM_data[-Index, ][!(is.na(BareNuclei))]
+
+# Model
+GLMModel <- glm(Class ~ . -ID, family = binomial, data = TrainingSetGLM, na.action = "na.omit")
+
+summary(GLMModel)
+
+# Predict with model
+LogPredictTrain <- predict(GLMModel, TrainingSetGLM, type = "response")
+PredClassTrainGLM <- as.numeric(ifelse(LogPredictTrain > 0.5, 1, 0))
+
+LogPredictTest <- predict(GLMModel, TestSetGLM, type = "response")
+PredClassTestGLM <- as.numeric(ifelse(LogPredictTest > 0.5, 1, 0))
+
+# How well does the model predicts?
+confusionMatrix(as.factor(PredClassTrainGLM), as.factor(TrainingSetGLM$Class)) # Accuracy 0.9782
+confusionMatrix(as.factor(PredClassTestGLM), as.factor(TestSetGLM$Class)) # Accuracy 0.9624
+```
