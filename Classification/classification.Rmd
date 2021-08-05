@@ -87,6 +87,12 @@ FeatImport <- varImp(Model)
 plot(FeatImport)
 ```
 
+kNN
+```{r}
+
+```
+
+
 Logistic regression as a classification method
 ```{r}
 # data
