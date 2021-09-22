@@ -1,0 +1,109 @@
+---
+title: "Permutation subset"
+output:
+  pdf_document: default
+  html_notebook: default
+---
+
+
+```{r}
+library("data.table")
+library("trio")
+source("Weinberg_optimised.R")
+set.seed(123)
+```
+
+
+No need to run this. It is how I made the subset of 10 families and 1000 variants
+```{r eval=FALSE}
+# Sample families
+fam <- fread("sorted_trios_QC.fam")
+samples_fam <- sample(unique(fam$V1),10)
+fwrite(fam[V1 %in% samples_fam, 1:2], file = "subset_fam.txt", row.names = FALSE, col.names = FALSE, sep = "\t")
+```
+
+```{r eval=FALSE}
+# Sample variants
+bim <- fread("sorted_trios_QC.bim")
+samples_bim <- as.data.table(sample(unique(bim$V2),1000))
+fwrite(samples_bim, file = "subset_bim.txt", row.names = FALSE, col.names = FALSE, sep = "\t")
+```
+
+In PLINK plink --bfile sorted_trios_QC --keep subset_fam.txt --extract subset_bim.txt --recode --out test_subset
+
+The code for original data and permuted data.
+```{r}
+PO <- 1999
+R <- 10
+W <- 0.42^2
+
+ped <- read.pedfile("/home/kim/Documents/UCD/R/SPARK_data/Debugging/subset_with_sig.ped", first.row = TRUE, coded = "ATCG", naVal = 0, cols4ID = TRUE)
+
+## Original data
+  geno_original <- ped2geno(ped, coded = "ATCG") # too small sample
+  
+  # Estimating maternal effects
+  maternal_original <- WeinbergLRT_op(geno_original, model = "general", maternal = T,  child = F)
+  
+  
+  maternal_original[, Z := estS1/ seS1]
+  
+  maternal_original[, BF :=  sqrt(seS1^2 + W / seS1^2) * exp((-Z^2/2)*(W/(seS1^2 + W)))]
+  ped_original <- ped
+
+## One permutation:
+
+  ped <- as.data.table(ped)
+  no_trios <- length(unique(ped$famid))
+  
+  # Coin that decides to change the lable or not
+  set.seed(123)
+  coin <- sample(1:2, no_trios, replace = TRUE)
+  
+  # Father = 1, mother = 2
+  # If coin changed to 2 --> father becomes mother, and mother becomes father
+  for (i in 1:length(coin)) {
+    ped[(1+i*3-3), sex := coin[i]] 
+    ped[(2+i*3-3), sex := ifelse(coin[i] == 1, 2,1) ]
+  }
+  # permutated ped used in analysis
+  new_ped <- ped[order(famid, fatid, motid, sex)]
+  geno_perm <- ped2geno(new_ped, coded = "ATCG")
+  
+  # Estimating maternal effects
+  maternal_perm <- WeinbergLRT_op(geno_perm, model = "general", maternal = T,  child = F)
+  
+  
+  maternal_perm[, Z := estS1/ seS1]
+  maternal_perm[, BF :=  sqrt(seS1^2 + W / seS1^2) * exp((-Z^2/2)*(W/(seS1^2 + W)))]
+
+
+# All are same except this 4
+ index <- which(round(maternal_perm$BF, digits = 6) != round(maternal_original$BF, digit = 6))
+ index
+```
+
+
+Out of 829 variants, 6 have different BF, the rest have the same.
+When we compare them, only BF for three variant is higher than the BF from the original dataset, the rest are the same or lower (making our finding unrelevant).
+```{r}
+maternal_original[index, c("SNP", "BF")] 
+```
+
+```{r}
+maternal_perm[index, c("SNP", "BF")]
+```
+
+```{r}
+coin # 4, 6, 7 and 8 famid should have switched parents
+```
+
+Compare original dataset and created permuted dataset
+```{r}
+ped_original[c(10:12, 16:22),c(1:5,13:14,19:24 )]
+```
+
+```{r}
+new_ped[c(10:12, 16:22),c(1:6,13:14,19:24)]
+```
+
