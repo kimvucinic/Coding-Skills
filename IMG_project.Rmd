@@ -1,0 +1,708 @@
+---
+title: "RNA-seq analysis"
+output: html_notebook
+---
+```{r}
+# If you're missing some of the packages, install them using the appropriate command:
+
+# install.packages("data.table")
+# install.packages("readxl")
+# install.packages("hexbin")
+
+# if (!requireNamespace("BiocManager", quietly = TRUE))
+#     install.packages("BiocManager")
+
+# BiocManager::install("DESeq2")
+# BiocManager::install("DEGreport")
+# BiocManager::install("apeglm")
+# BiocManager::install("org.Hs.eg.db")
+# BiocManager::install("GO.db")
+# BiocManager::install("GOstats")
+# BiocManager::install("pathview")
+# BiocManager::install("gage")
+# BiocManager::install("gageData")
+```
+
+```{r}
+library(data.table)
+library(readxl)
+library(magrittr)
+
+# for DES analysis
+library(DESeq2)
+library(DEGreport)
+library(apeglm)
+
+# for visualization
+library(ggplot2)
+library(pheatmap)
+library(ggrepel)
+
+# for gene ontology analysis
+library(AnnotationDbi)
+library(org.Hs.eg.db)
+library(GO.db)
+library(GOstats)
+
+# for pathway analysis
+library(pathview)
+library(gage)
+library(gageData)
+```
+
+## Load data and format it:
+```{r}
+info_samples <-  as.data.table(read_excel("sample_sheet.xlsx", 1) )
+
+SeqRun1 <- fread("ReadCounts/gene_counts_SequencingRun1.tsv")
+SeqRun2 <- fread("ReadCounts/gene_counts_SequencingRun2.tsv")
+
+# Merge count tables of different sequencing runs
+SeqDataMerged <- merge(x = SeqRun1,
+                       y = SeqRun2,
+                       by = c('Geneid', 'gene_name'))
+
+
+# Remove unsuitable cell lines from analysis
+sample_dt <- info_samples[!(Cell_Line %in% c("ERM", "DFT5")) & Cell_Type != "BCCF"]
+
+# change columns that we are interested to factor
+colsFactor <- c("Cell_Type", "Treatment")
+setDT(sample_dt)[, (colsFactor):= lapply(.SD, factor), .SDcols = colsFactor]
+
+str(sample_dt) # sanity check
+
+# it's preferred that the first level of a factor is a reference
+sample_dt$Treatment <- factor(sample_dt[, Treatment], levels = c("Untreated", "Treated"))
+count_dt <- SeqDataMerged[, sample_dt$Sample_Name, with = FALSE]
+gene_map <- SeqDataMerged[, 1:2]
+```
+
+
+## Normalization of count data for QC
+```{r}
+# Convert data.table to Matrix
+mSeqData <- as.matrix(count_dt,
+                      rownames = gene_map$Geneid)
+
+# check order
+stopifnot(all(sample_dt$Sample_Name == colnames(mSeqData)))
+
+# filtering rows that have no or little amount of information about gene expression
+nrow(mSeqData) # 60623 genes
+table(rowSums(mSeqData) <= 1) # 31001 (51.14%) genes have 0  or 1 transcript mapped
+
+
+# Testing for the effect of treatment controlling for the effect of different cell type
+deseq_dataset <- DESeqDataSetFromMatrix(countData = mSeqData,
+                                        colData = sample_dt,
+                                        design = ~ Cell_Type + Treatment)
+
+```
+
+## Choosing transformation method for count data
+```{r}
+deseq_dataset <- estimateSizeFactors(deseq_dataset)
+
+vsd <- vst(deseq_dataset, blind = FALSE)
+rld <- rlog(deseq_dataset, blind = FALSE)
+ 
+Log2Norm <- data.table(log2(counts(deseq_dataset, normalized=TRUE) + 1), Trans = "log2(x + 1)")
+Vsd_dt <- data.table(assay(vsd), Trans ="vst")
+Rld_dt <- data.table(assay(rld), Trans ="rlog")
+
+CompareTransf <- rbindlist(list(Log2Norm, Vsd_dt, Rld_dt))
+
+ggplot(CompareTransf, aes(x = R21G1, y = R21H1)) +
+  geom_hex(bins = 80) +
+  coord_fixed() +
+  facet_grid( . ~ Trans)  
+```
+```{r}
+# Box plots
+boxplot(counts(deseq_dataset, normalized=TRUE))
+boxplot(assay(vsd))
+boxplot(log2(counts(deseq_dataset, normalized=TRUE) + 1))
+boxplot(assay(rld))
+```
+
+## Transforming counts for data visualization
+```{r}
+rldQC <- rlog(deseq_dataset, blind = TRUE)
+```
+
+
+## Differences between samples
+```{r}
+# Hierarchical clustering
+EuDistsSamples <- dist(t(assay(rldQC)))
+mEuDistsSamples <- as.matrix(EuDistsSamples)
+
+rld_cor <- cor(mEuDistsSamples)
+rownames(rld_cor) <- paste(paste(rldQC$Treatment, rldQC$Cell_Line, sep = "_" ), rldQC$Sample_Name, sep = "-")
+
+pheatmap(rld_cor)
+
+
+# PCA
+pcaData <- plotPCA(rldQC, intgroup = c('Treatment', 'Cell_Type'), returnData = TRUE)
+percentVar <- round(100 * attr(pcaData, "percentVar"))
+ggplot(pcaData, aes(PC1, PC2, color = Treatment, shape = Cell_Type)) +
+  geom_point(size = 3) +
+  geom_text(aes(label = name), hjust = 0, vjust = 0) +
+  xlab(paste0("PC1: ", percentVar[1], "% variance")) +
+  ylab(paste0("PC2: ", percentVar[2], "% variance")) +
+  coord_fixed() +
+  theme_light()
+```
+
+It clearly separates based on cell type
+
+However, I want to check batch effect and sequencing runs
+
+
+```{r}
+pcaData2 <- plotPCA(rldQC, intgroup = c( 'Cell_Type', 'Cell_Line','Experiment_Batch', 'Sequencing_Run', 'Treatment'), returnData = TRUE)
+percentVar2 <- round(100 * attr(pcaData2, "percentVar"))
+a <- "Experiment_Batch"
+if (a %in% colnames(pcaData2)){
+  pos <- match(a, colnames(pcaData2))
+  plot <- ggplot(pcaData2, aes(PC1, PC2, color = pcaData2[, pos])) + geom_point(size = 3) + geom_text(aes(label = name), hjust = 0, vjust = 0)
+  plot
+  }else{
+    warning("The criterium does not exist as a column in a dataset.")
+  }
+```
+
+
+```{r}
+PCAColorByIntGroup <- function(data, intgroup){
+  percentVars <- round(100 * attr(data, "percentVar"))
+  if (intgroup %in% colnames(data)){
+    pos <- match(intgroup, colnames(pcaData2))
+    plot <- ggplot(data, aes(PC1, PC2, color = data[, pos])) +
+              geom_point(size = 3) +
+              geom_text(aes(label = name), hjust = 0, vjust = 0) +
+              xlab(paste0("PC1: ", percentVars[1], "% variance")) +
+              ylab(paste0("PC2: ", percentVars[2], "% variance")) +
+              coord_fixed() + theme_light()
+    return(plot)
+  } else {
+    warning("The criterium does not exist as a column in a dataset.")
+  }
+}
+
+PCAColorByIntGroup(pcaData2, "Experiment_Batch")
+PCAColorByIntGroup(pcaData2, "Sequencing_Run")
+PCAColorByIntGroup(pcaData2, "Cell_Line")
+PCAColorByIntGroup(pcaData2, "Cell_Type")
+```
+
+Check all principal components:
+```{r}
+# calculate the variance for each gene
+  RowVar <- rowVars(assay(rldQC))
+
+  # select the ntop genes by variance
+  select <- order(RowVar, decreasing=TRUE)[seq_len(min(500, length(RowVar)))]
+ 
+# perform a PCA on the data in assay(x) for the selected genes
+  PCAdetailed <- prcomp(t(assay(rldQC)[select,]))
+
+  # the contribution to the total variance for each component
+  percentVarTot <- PCAdetailed$sdev^2 / sum(PCAdetailed$sdev^2)
+ 
+barplot(percentVarTot)
+
+intgroup = c("Treatment")
+intgroup.dt <- as.data.table(colData(rldQC)[, intgroup, drop=FALSE])
+
+eigenval <- PCAdetailed$x
+ 
+d <- data.table(PC1 = eigenval[,1], PC2 = eigenval[,2], PC3 = eigenval[,3], PC4 = eigenval[,4], PC5 = eigenval[,5], name = colnames(rldQC), batch = sample_dt$Experiment_Batch, run = sample_dt$Sequencing_Run, cell_t = sample_dt$Cell_Type)
+
+pairs(eigenval[,1:5], col = sample_dt$Treatment)
+
+ggplot(data = d, aes_string(x = "PC3", y = "PC5", color = "batch")) +
+  geom_point(size=3) +
+  xlab(paste0("PC3: ",round(percentVar[3] * 100),"% variance")) +
+  ylab(paste0("PC5: ",round(percentVar[5] * 100),"% variance")) +
+  geom_text(aes(label = name), hjust = 0, vjust = 0) +
+  coord_fixed() + theme_bw()
+
+ggplot(data = d, aes_string(x = "PC3", y = "PC4", color = "batch")) +
+  geom_point(size=3) +
+  xlab(paste0("PC3: ",round(percentVar[3] * 100),"% variance")) +
+  ylab(paste0("PC4: ",round(percentVar[4] * 100),"% variance")) +
+  geom_text(aes(label = name), hjust = 0, vjust = 0) +
+  coord_fixed() + theme_bw()
+
+ggplot(data = d, aes_string(x = "PC2", y = "PC4", color = "batch")) +
+  geom_point(size=3) +
+  xlab(paste0("PC2: ",round(percentVar[2] * 100),"% variance")) +
+  ylab(paste0("PC4: ",round(percentVar[4] * 100),"% variance")) +
+  geom_text(aes(label = name), hjust = 0, vjust = 0) +
+  coord_fixed() + theme_bw()
+```
+
+## Vizualization with removed batch effect
+```{r}
+# normalization
+plotPCA(rld, intgroup = c("Treatment", "Cell_Type"))
+
+# Removing batch effect for cell line
+rld2 <- rld
+rld_mat <-assay(rld)
+model_mat <- model.matrix(~Cell_Type + Treatment + Cell_Type*Treatment, colData(rld))
+removedBatch_mat <- limma::removeBatchEffect(rld_mat, batch = rld$Cell_Line, design = model_mat)
+
+assay(rld2) <- removedBatch_mat
+
+# PCA
+plotPCA(rld2, intgroup = c("Treatment", "Cell_Type")) + theme_light() 
+```
+
+```{r}
+# HC
+EuDistsSamples2 <- dist(t(assay(rld)))
+mEuDistsSamples2 <- as.matrix(EuDistsSamples2)
+rld_cor2 <- cor(mEuDistsSamples2)
+
+rownames(rld_cor2) <- paste(paste(rld$Treatment, rld$Cell_Line, sep = "_" ), rld$Sample_Name, sep = "-")
+
+pheatmap(rld_cor2)
+```
+
+
+## Differential expression analysis
+```{r}
+# within-group labelling of biological replicates
+sample_dt$sample_subgr <- factor(ifelse(sample_dt$Cell_Line %in% c("HFP3", "ZAM"), 1, 2))
+
+# create a new object
+deseq_dataset_postQC <- DESeqDataSetFromMatrix(countData = mSeqData,
+                                                colData = sample_dt,
+                                                design = ~ Cell_Type + Treatment)
+
+# filtering of very low counts
+deseq_dataset_postQC <- deseq_dataset_postQC[rowSums(counts(deseq_dataset_postQC)) > 5, ]
+
+design(deseq_dataset_postQC) <- ~ Cell_Type + Cell_Type:sample_subgr + Cell_Type:Treatment
+deseq_dataset_postQC <- DESeq(object = deseq_dataset_postQC)
+
+# find names of coefficients
+resultsNames(deseq_dataset_postQC)
+
+# Treated DF vs untreated DF
+DF_res <- results(deseq_dataset_postQC, name = "Cell_TypeDF.TreatmentTreated")
+DF_res_sub <- subset(DF_res, padj < 0.05)
+DF_res_sub.sorted <- DF_res_sub[order(DF_res_sub$padj), ]
+
+# write.table(DF_res, file = "DF.csv")
+
+
+# Untreated MELF vs untreated DF
+# create a new object
+deseq_dataset_postQC2 <- DESeqDataSetFromMatrix(countData = mSeqData[,sample_dt[Treatment == "Untreated", Sample_Name]],
+                                                colData = sample_dt[Treatment == "Untreated", ],
+                                                design = ~ sample_subgr + Cell_Type)
+
+# filtering of very low counts
+deseq_dataset_postQC2 <- deseq_dataset_postQC2[rowSums(counts(deseq_dataset_postQC2)) > 5, ]
+
+deseq_dataset_postQC2 <- DESeq(object = deseq_dataset_postQC2)
+
+# find names of coefficients
+resultsNames(deseq_dataset_postQC2)
+
+# identify genes with the desired adjusted p-value and lfc cut-off
+MELFvsDF_res <- results(deseq_dataset_postQC2, name = "Cell_Type_MELF_vs_DF")
+MELFvsDF_res_sub <- subset(MELFvsDF_res, padj < 0.05 & abs(log2FoldChange) >= 0.58)
+MELFvsDF_res_sub.sorted <- MELFvsDF_res_sub[order(MELFvsDF_res_sub$padj), ]
+
+# write.table(MELFvsDF_res, file = "MELFvsDF.csv")
+# write.table(counts(deseq_dataset_postQC, normalized = TRUE), file = "dds_norm.csv")
+```
+
+## MA plot
+```{r}
+## MELF vs DF
+plotMA(MELFvsDF_res)
+
+## DF
+plotMA(DF_res)
+```
+
+
+## Heatmap of significant genes
+```{r}
+## MELF vs DF
+MELF_sig <- rownames(MELFvsDF_res_sub)
+length(MELF_sig) # 1156 significant genes
+
+# extract rlog-transformed values into a matrix
+mRLD_MELFvsDF <- assay(rld)[MELF_sig,]
+
+# heatmap of DEG
+pheatmap(mRLD_MELFvsDF, scale="row", show_rownames = FALSE, main = "Untreated MELF vs Untreated DF (row-based z-score)")
+
+## DF
+DF_sig <- rownames(DF_res_sub)
+length(DF_sig) # 23 significant genes
+
+# extract rlog-transformed values into a matrix
+mRLD_DF <- assay(rld)[DF_sig, sample_dt[Cell_Type == "DF", Sample_Name]]
+
+# heatmap of DEG
+pheatmap(mRLD_DF, scale="row", show_rownames = FALSE, main = "Treated DF vs Untreated DF (row-based z-score)")
+```
+
+## Volcano plot
+```{r}
+# MELF vs DF
+dt_VolcanoCellDiff <- as.data.table(MELFvsDF_res)
+dt_VolcanoCellDiff[, Gene := rownames(MELFvsDF_res)]
+dt_VolcanoCellDiff[, threshold := ifelse(Gene %in% MELF_sig, "yes", "no")]
+
+ggplot(dt_VolcanoCellDiff) +
+  		geom_point(aes(x = log2FoldChange, y = -log10(padj)), color = "grey") +
+  	  geom_point(data = dt_VolcanoCellDiff[threshold == "yes" & log2FoldChange >= 0], 
+  	       aes(x = log2FoldChange, y = -log10(padj)), color = "red") +
+      geom_point(data = dt_VolcanoCellDiff[threshold == "yes" & log2FoldChange < 0], 
+          aes(x = log2FoldChange, y = -log10(padj)), color = "blue") +	
+      geom_text_repel(data = dt_VolcanoCellDiff[padj <= 0.05 & abs(log2FoldChange) > 2], 
+          aes(x = log2FoldChange, y = -log10(padj), label = dt_VolcanoCellDiff[padj <= 0.05 & abs(log2FoldChange) > 2, Gene])) +
+  		ggtitle('Untreated MELF vs untreated DF') +
+  		xlab("log2 fold change") + 
+      ylab("-log10 adjusted p-value") +
+  		theme(legend.position = "none",
+        	plot.title = element_text(size = rel(1.5)),
+        	axis.title = element_text(size = rel(1.5)),
+        	axis.text = element_text(size = rel(1.25))) +
+  theme_bw()
+```
+
+
+```{r}
+# DF
+dt_VolcanoDF <- as.data.table(DF_res)
+dt_VolcanoDF[, Gene := rownames(DF_res)]
+dt_VolcanoDF[, threshold := ifelse(Gene %in% DF_sig, "yes", "no")]
+
+ggplot(dt_VolcanoDF) +
+  		geom_point(aes(x = log2FoldChange, y = -log10(padj)), color = "darkgrey") +
+      geom_point(data = dt_VolcanoDF[threshold== "yes" & log2FoldChange >= 0], 
+  	       aes(x = log2FoldChange, y = -log10(padj)), color = "red") +
+      geom_point(data = dt_VolcanoDF[threshold == "yes" & log2FoldChange < 0], 
+          aes(x = log2FoldChange, y = -log10(padj)), color = "blue") +
+      geom_text_repel(data = dt_VolcanoDF[padj <= 0.05 & abs(log2FoldChange) >= 0.58], aes(x = log2FoldChange, y = -log10(padj), 
+                label = Gene)) +
+  		ggtitle('Treated vs Untreated DF') +
+  		xlab("log2 fold change") + 
+      ylab("-log10 adjusted p-value") +
+  		theme(legend.position = "none",
+        	plot.title = element_text(size = rel(1.5)),
+        	axis.title = element_text(size = rel(1.5)),
+        	axis.text = element_text(size = rel(1.25))) +
+  theme_bw()
+```
+
+## Annotation
+```{r}
+DF_res$Symbol <- mapIds(x = org.Hs.eg.db,
+                        key = rownames(DF_res),
+                        column = "SYMBOL",
+                        keytype = "ENSEMBL",
+                        multival = "first")
+
+DF_res$Entrez <- mapIds(x = org.Hs.eg.db,
+                        key = rownames(DF_res),
+                        column = "ENTREZID",
+                        keytype = "ENSEMBL",
+                        multival = "first")
+
+MELFvsDF_res$Symbol <- mapIds(x = org.Hs.eg.db,
+                        key = rownames(MELFvsDF_res),
+                        column = "SYMBOL",
+                        keytype = "ENSEMBL",
+                        multival = "first")
+
+MELFvsDF_res$Entrez <- mapIds(x = org.Hs.eg.db,
+                        key = rownames(MELFvsDF_res),
+                        column = "ENTREZID",
+                        keytype = "ENSEMBL",
+                        multival = "first")
+```
+
+## Gene ontology
+```{r}
+# MELF vs DF
+sigMELFvsDF_dt <- as.data.table(subset(MELFvsDF_res, padj <= 0.05))
+
+UpGenes_MELFvsDF <- unique(sigMELFvsDF_dt[log2FoldChange > 0.58, Entrez]) 
+length(UpGenes_MELFvsDF) # 477 upregulated genes
+
+DownGenes_MELFvsDF <- unique(sigMELFvsDF_dt[log2FoldChange < -0.58, Entrez]) 
+length(DownGenes_MELFvsDF) # 645 downregulated genes
+
+# DF
+sigDF_dt <- as.data.table(subset(DF_res, padj <= 0.05))
+sigDF_dt[, Gene := rownames(subset(DF_res, padj <= 0.05))]
+
+UpGenes_DF <- unique(sigDF_dt[log2FoldChange > 0.58, Entrez]) 
+length(UpGenes_DF) # 20 upregulated genes
+
+DownGenes_DF <- unique(sigDF_dt[log2FoldChange < -0.58, Entrez]) 
+length(DownGenes_DF) # 0
+```
+
+```{r}
+DF_only <- deseq_dataset_postQC[, sample_dt[Cell_Type == "DF", Sample_Name]]
+sigDF_dt[log2FoldChange < 0, Symbol]
+
+# plot of 3 downregulated genes
+degPlot(dds = DF_only, res = DF_res, n = 3, xs = "Treatment", batch = "Cell_Line", color = "blue", genes = unique(sigDF_dt[log2FoldChange < 0, Gene]))
+
+# plot o top 3 significant genes
+degPlot(dds = DF_only, res = DF_res, n = 3, xs = "Treatment", batch = "Cell_Line", color = "blue")
+sigDF_dt[order(padj)]
+```
+
+Parameters
+```{r}
+universeGenesMELFvsDF <- unique(MELFvsDF_res$Entrez)
+universeGenesDF <- unique(DF_res$Entrez)
+cutoff <- 0.05
+
+upParamsMELFvsDF <- new("GOHyperGParams",
+                          geneIds = UpGenes_MELFvsDF,
+                          universeGeneIds = universeGenesMELFvsDF,
+                          annotation = "org.Hs.eg.db",
+                          ontology = "BP",
+                          pvalueCutoff = cutoff,
+                          conditional = FALSE,
+                          testDirection = "over")
+
+downParamsMELFvsDF <- new("GOHyperGParams",
+                          geneIds = DownGenes_MELFvsDF,
+                          universeGeneIds = universeGenesMELFvsDF,
+                          annotation = "org.Hs.eg.db",
+                          ontology = "BP",
+                          pvalueCutoff = cutoff,
+                          conditional = FALSE,
+                          testDirection = "over")
+
+upParamsDF <- new("GOHyperGParams",
+                  geneIds = UpGenes_DF,
+                  universeGeneIds = universeGenesDF,
+                  annotation = "org.Hs.eg.db",
+                  ontology = "BP", 
+                  pvalueCutoff = cutoff,
+                  conditional = FALSE,
+                  testDirection = "over")
+
+```
+
+## Biological process
+Hypergeometric tests
+```{r}
+upBP_MELFvsDF <- hyperGTest(upParamsMELFvsDF)
+summary(upBP_MELFvsDF)[1:10,]
+```
+
+```{r}
+downBP_MELFvsDF <- hyperGTest(downParamsMELFvsDF)
+summary(downBP_MELFvsDF)[1:10,]
+```
+
+
+```{r}
+upBP_DF <- hyperGTest(upParamsDF)
+summary(upBP_DF)[1:10,]
+```
+
+## Cellular component
+```{r}
+ontology(upParamsMELFvsDF) <- "CC"
+upCC_MELFvsDF <- hyperGTest(upParamsMELFvsDF)
+summary(upCC_MELFvsDF)[1:10,]
+```
+
+```{r}
+ontology(downParamsMELFvsDF) <- "CC"
+downCC_MELFvsDF <- hyperGTest(downParamsMELFvsDF)
+summary(downCC_MELFvsDF)[1:10,]
+```
+
+
+```{r}
+ontology(upParamsDF) <- "CC"
+upCC_DF <- hyperGTest(upParamsDF)
+summary(upCC_DF)
+```
+
+## Molecular function
+```{r}
+ontology(upParamsMELFvsDF) <- "MF"
+upMF_MELFvsDF <- hyperGTest(upParamsMELFvsDF)
+summary(upMF_MELFvsDF)[1:10,]
+```
+
+```{r}
+ontology(downParamsMELFvsDF) <- "MF"
+downMF_MELFvsDF <- hyperGTest(downParamsMELFvsDF)
+summary(downMF_MELFvsDF)[1:10,]
+```
+
+
+```{r}
+ontology(upParamsDF) <- "MF"
+upMF_DF <- hyperGTest(upParamsDF)
+summary(upMF_DF)[1:10, ]
+```
+
+## Gene set enrichment for pathway analysis
+```{r}
+# Data
+data("go.sets.hs")
+data("go.subs.hs")
+
+gobpsets <- go.sets.hs[go.subs.hs$BP]
+goccsets <- go.sets.hs[go.subs.hs$CC]
+gomfsets <- go.sets.hs[go.subs.hs$MF]
+```
+
+```{r}
+# Storing LFC for GO enrichment
+
+# MELF vs DF
+foldchanges_MELFvsDF <-MELFvsDF_res$log2FoldChange
+names(foldchanges_MELFvsDF) <-MELFvsDF_res$Entrez
+
+# DF
+foldchanges_DF <- DF_res$log2FoldChange
+names(foldchanges_DF) <- DF_res$Entrez
+```
+
+```{r}
+# MELF vs DF
+# Calculating for biological processes, molecular function and cellular components
+goBP_resMELFvsDF <- gage(exprs = foldchanges_MELFvsDF, gsets = gobpsets, same.dir = TRUE)
+goMF_resMELFvsDF <- gage(exprs = foldchanges_MELFvsDF, gsets = gomfsets, same.dir = TRUE)
+goCC_resMELFvsDF <- gage(exprs = foldchanges_MELFvsDF, gsets = goccsets, same.dir = TRUE)
+
+# DF
+# Calculating for biological processes, molecular function and cellular components
+goBP_DF <- gage(exprs = foldchanges_DF, gsets = gobpsets, same.dir = TRUE)
+goMF_DF <- gage(exprs = foldchanges_DF, gsets = gomfsets, same.dir = TRUE)
+goCC_DF <- gage(exprs = foldchanges_DF, gsets = goccsets, same.dir = TRUE)
+```
+
+```{r}
+# MELF vs DF
+View(goBP_resMELFvsDF$greater) # 0 significant
+View(goCC_resMELFvsDF$greater) # 0 significant
+View(goMF_resMELFvsDF$greater) # 0 significant
+
+View(goBP_resMELFvsDF$less)
+View(goCC_resMELFvsDF$less)
+View(goMF_resMELFvsDF$less) # 0 significant
+
+#or ?
+goBP_resMELFvsDF$less[1:5,]
+```
+
+
+Combine results for visualization
+```{r}
+# MELF vs DF
+
+#down regulated
+BP_dt_MELFdown <- data.table(GO_term = rownames(goBP_resMELFvsDF$less),
+                             class = rep("BP", length(rownames(goBP_resMELFvsDF$less))),
+                             goBP_resMELFvsDF$less)[goBP_resMELFvsDF$less[,4] <= 0.05][, c(1,5:7, 2)]
+
+CC_dt_MELFdown <- data.table(GO_term = rownames(goCC_resMELFvsDF$less),
+                             class = rep("CC", length(rownames(goCC_resMELFvsDF$less))),
+                             goCC_resMELFvsDF$less)[goCC_resMELFvsDF$less[,4] <= 0.05][, c(1,5:7, 2)]
+
+MF_dt_MELFdown <- data.table(GO_term = rownames(goMF_resMELFvsDF$less),
+                             class = rep("MF", length(rownames(goMF_resMELFvsDF$less))),
+                             goMF_resMELFvsDF$less)[goMF_resMELFvsDF$less[,4] <= 0.05][, c(1,5:7, 2)]
+
+MELFvsDF_downregulated <- rbindlist(list(BP_dt_MELFdown, CC_dt_MELFdown, MF_dt_MELFdown))
+MELFvsDF_downregulated[, c("GO_code", "GO_term") := tstrsplit(sub(" ", ";", GO_term), ";")]
+
+ggplot(MELFvsDF_downregulated, aes(x = set.size, y = reorder(GO_term, set.size))) +
+  geom_bar(stat = "identity",  fill = "chartreuse4") +
+  labs(title = "Biological Process", subtitle = "Untreated MELF vs Untreated DF - down regulated", x = "Counts") +
+  theme_light() +
+   theme(axis.title.y = element_blank(),
+        plot.title.position = "plot", 
+         legend.position = "none")
+
+ggplot(MELFvsDF_downregulated[class == "CC"], aes(x = set.size, y = reorder(GO_term, set.size))) +
+  geom_bar(stat = "identity",  fill = "cornflowerblue") +
+  labs(title = "Cellular Components", subtitle = "Untreated MELF vs Untreated DF - down regulated", x = "Counts") +
+  theme_light() +
+   theme(axis.title.y = element_blank(),
+         plot.title.position = "plot", 
+         legend.position = "none")
+
+```
+
+```{r}
+# DF
+View(goBP_DF$greater)
+View(goCC_DF$greater)
+View(goMF_DF$greater)
+
+View(goBP_DF$less)
+View(goCC_DF$less)
+View(goMF_DF$less)
+
+# 0 up and down regulated
+```
+
+
+
+## KEGG pathways
+```{r}
+data("kegg.sets.hs")
+```
+
+```{r}
+# MELF vs DF pathway analysis
+keggRes_MELFvsDF <- gage(exprs = foldchanges_MELFvsDF, gsets = kegg.sets.hs, same.dir = TRUE)
+
+View(keggRes_MELFvsDF$greater)
+View(keggRes_MELFvsDF$less)
+```
+
+```{r}
+UpPath_MELFvsDF <- data.table(id = rownames(keggRes_MELFvsDF$greater), keggRes_MELFvsDF$greater)[keggRes_MELFvsDF$greater[,4] <= 0.05, id]
+DownPath_MELFvsDF <- data.table(id = rownames(keggRes_MELFvsDF$less), keggRes_MELFvsDF$less)[keggRes_MELFvsDF$less[,4] <= 0.05, id]
+
+keggMELFvsDF_ids_Down <- substr(DownPath_MELFvsDF, start = 1, stop = 8)
+```
+
+
+```{r}
+# DF
+keggRes_DF <- gage(exprs = foldchanges_DF, gsets = kegg.sets.hs, same.dir = TRUE)
+
+View(keggRes_DF$greater) # 0
+View(keggRes_DF$less) # 0
+```
+
+
+```{r}
+UpPath_DF <- data.table(id = rownames(keggRes_DF$greater), keggRes_DF$greater)[keggRes_DF$greater[,4] <= 0.05, id]
+DownPath_DF <- data.table(id = rownames(keggRes_DF$less), keggRes_DF$less)[keggRes_DF$less[,4] <= 0.05, id]
+# no pathways
+```
+
+```{r}
+# download images
+tmp <- sapply(keggMELFvsDF_ids_Down, function(pid) pathview(gene.data = foldchanges_MELFvsDF, pathway.id =  pid, species = "hsa"))
+```
